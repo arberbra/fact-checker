@@ -1,6 +1,8 @@
 import os
 import textwrap
 import re
+from io import BytesIO
+from typing import List, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -13,6 +15,11 @@ try:
     HAS_ANTHROPIC = True
 except Exception:
     HAS_ANTHROPIC = False
+
+# Lightweight RAG deps
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from pypdf import PdfReader
 
 
 # --- Startup: load .env if present ---
@@ -28,6 +35,56 @@ def _extract_query_terms(query: str) -> list:
         "what","who","when","where","why","how","does","did","with","about"
     }
     return [t for t in tokens if len(t) >= 3 and t not in stop]
+
+
+def _chunk_text(text: str, chunk_size: int = 800, chunk_overlap: int = 120) -> List[str]:
+    """Simple fixed-size chunker with overlap."""
+    tokens = text.split()
+    chunks = []
+    start = 0
+    while start < len(tokens):
+        end = min(len(tokens), start + chunk_size)
+        chunks.append(" ".join(tokens[start:end]))
+        if end == len(tokens):
+            break
+        start = max(end - chunk_overlap, start + 1)
+    return chunks
+
+
+def _read_pdf(file_bytes: bytes) -> str:
+    reader = PdfReader(BytesIO(file_bytes))
+    out = []
+    for page in reader.pages:
+        try:
+            out.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n\n".join(s for s in out if s)
+
+
+def build_retriever(docs: List[Tuple[str, str]]):
+    """Build a TF-IDF retriever from a list of (source_name, text) docs."""
+    sources = []
+    chunks = []
+    for src, text in docs:
+        for chunk in _chunk_text(text):
+            sources.append(src)
+            chunks.append(chunk)
+
+    if not chunks:
+        return None, [], []
+
+    vectorizer = TfidfVectorizer(stop_words="english")
+    matrix = vectorizer.fit_transform(chunks)
+    return (vectorizer, matrix), chunks, sources
+
+
+def retrieve_top_k(retriever, chunks: List[str], query: str, k: int = 5) -> List[Tuple[str, float]]:
+    vectorizer, matrix = retriever
+    q_vec = vectorizer.transform([query])
+    sims = cosine_similarity(q_vec, matrix).ravel()
+    idxs = sims.argsort()[::-1][:k]
+    return [(chunks[i], float(sims[i])) for i in idxs if sims[i] > 0]
 
 
 def search_web(query: str) -> str:
@@ -61,15 +118,15 @@ def search_web(query: str) -> str:
     return combined
 
 
-def summarize_with_anthropic(text: str, query: str) -> str:
-    """Summarize retrieved text with Anthropic, if available and key is set."""
+def summarize_with_anthropic(text: str, query: str, rag_context: str = "") -> str:
+    """Summarize retrieved text with Anthropic, optionally including RAG context."""
     if not HAS_ANTHROPIC:
         return "Anthropic integration not installed."
     if not os.getenv("ANTHROPIC_API_KEY"):
         return "ANTHROPIC_API_KEY not set. Skipping summary."
 
-    # Keep prompt size reasonable
-    context = text[:12000]
+    context = text[:10000]
+    rag = rag_context[:6000] if rag_context else ""
 
     llm = ChatAnthropic(
         model="claude-3-5-sonnet-20240620",
@@ -78,16 +135,20 @@ def summarize_with_anthropic(text: str, query: str) -> str:
 
     prompt = textwrap.dedent(
         f"""
-        You are a precise research assistant. Given the user's query and extracted web snippets,
-        produce a concise, well-structured fact-check style summary. Include citations as bullet
-        points if URLs or domains are present in the snippets. If information is uncertain, say so.
+        You are a precise research assistant. Use the user's query, web snippets, and any retrieved
+        document context to produce a concise, well-structured fact-check. Prefer quoted, attributed
+        facts from the RAG context when relevant. If information is uncertain, say so.
 
-        Query: {query}
+        Query:
+        {query}
 
-        Snippets:
+        Web snippets:
         {context}
 
-        Task: Provide a brief summary (<= 200 words) answering the query.
+        Retrieved document context:
+        {rag or '[none]'}
+
+        Task: Provide a brief answer (<= 250 words) with bullet citations by source name or domain.
         """
     ).strip()
 
@@ -98,7 +159,7 @@ def summarize_with_anthropic(text: str, query: str) -> str:
 # --- Streamlit UI ---
 st.set_page_config(page_title="Fact Checker", page_icon="🔎", layout="wide")
 st.title("🔎 Fact Checker")
-st.caption("Web search with optional Anthropic summarization")
+st.caption("Web search with optional RAG and Anthropic summarization")
 
 with st.sidebar:
     st.header("Settings")
@@ -124,28 +185,76 @@ with st.sidebar:
 os.environ["SERPER_API_KEY"] = st.session_state.get("serper_key", "")
 os.environ["ANTHROPIC_API_KEY"] = st.session_state.get("anthropic_key", "")
 
+# RAG document upload
+st.subheader("Knowledge Base (optional)")
+uploaded_files = st.file_uploader(
+    "Upload PDFs or text files to use for retrieval",
+    type=["pdf", "txt"],
+    accept_multiple_files=True,
+)
+
+kb_docs: List[Tuple[str, str]] = []
+for f in uploaded_files or []:
+    content = ""
+    if f.type == "application/pdf" or f.name.lower().endswith(".pdf"):
+        try:
+            content = _read_pdf(f.getvalue())
+        except Exception:
+            content = ""
+    else:
+        try:
+            content = f.getvalue().decode("utf-8", errors="ignore")
+        except Exception:
+            content = ""
+    if content.strip():
+        kb_docs.append((f.name, content))
+
+retriever = None
+retriever_chunks: List[str] = []
+retriever_sources: List[str] = []
+if kb_docs:
+    retriever, retriever_chunks, retriever_sources = build_retriever(kb_docs)
+
 query = st.text_input(
     "Enter a query to fact-check",
     placeholder="e.g., What did the latest CPI report say?",
     key="query",
 )
-col1, _ = st.columns([1, 2])
+col1, col2, _ = st.columns([1, 1, 2])
 
 with col1:
-    do_search = st.button("Search", type="primary")
-    do_summary = st.checkbox("Summarize with Anthropic", value=False)
+    do_search = st.button("Search Web", type="primary")
+with col2:
+    use_rag = st.checkbox("Use RAG (retrieve from uploaded docs)", value=False)
 
 if do_search and query.strip():
     try:
         with st.spinner("Searching the web..."):
-            results_text = search_web(query.strip())
+            web_text = search_web(query.strip())
         st.subheader("Search Snippets")
-        st.write(results_text)
+        st.write(web_text)
 
-        if do_summary and not results_text.lower().startswith("no results found"):
-            with st.spinner("Summarizing..."):
-                summary = summarize_with_anthropic(results_text, query.strip())
-            st.subheader("Summary")
+        rag_context = ""
+        if use_rag and retriever is not None:
+            with st.spinner("Retrieving from uploaded documents..."):
+                top = retrieve_top_k(retriever, retriever_chunks, query.strip(), k=5)
+                # annotate with simple source names when possible
+                rag_lines = []
+                for chunk, score in top:
+                    rag_lines.append(f"[score={score:.2f}] {chunk}")
+                rag_context = "\n\n".join(rag_lines)
+                if not rag_context:
+                    st.info("No relevant RAG chunks found.")
+                else:
+                    st.subheader("Retrieved Context (top chunks)")
+                    st.write(rag_context)
+        elif use_rag and retriever is None:
+            st.info("Upload documents first to enable RAG.")
+
+        if HAS_ANTHROPIC and os.getenv("ANTHROPIC_API_KEY") and not web_text.lower().startswith("no results found"):
+            with st.spinner("Summarizing with Anthropic..."):
+                summary = summarize_with_anthropic(web_text, query.strip(), rag_context)
+            st.subheader("Answer")
             st.write(summary)
     except Exception as e:
         st.error(str(e))

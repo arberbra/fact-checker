@@ -1,6 +1,6 @@
 ## Fact Checker App
 
-Web search via Serper.dev with optional Anthropic summarization, wrapped in Streamlit.
+Web search via Serper.dev with optional RAG and Anthropic summarization, wrapped in Streamlit.
 
 ### 1) Setup
 
@@ -30,6 +30,12 @@ streamlit run app.py
 ```
 
 Open the URL printed in the terminal (usually http://localhost:8501).
+
+### 3) RAG (Retrieval-Augmented Generation)
+- Upload PDFs or plain text files in the "Knowledge Base (optional)" section.
+- Toggle "Use RAG" to enable retrieval from your uploaded docs.
+- The app chunks documents and builds a lightweight TF‑IDF index for similarity search.
+- Retrieved chunks are shown and also injected into the Anthropic summary when enabled.
 
 ### Notes
 - The sidebar lets you paste keys at runtime; the app does not persist secrets.
