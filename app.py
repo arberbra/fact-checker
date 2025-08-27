@@ -1,5 +1,6 @@
 import os
 import textwrap
+import re
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -18,8 +19,23 @@ except Exception:
 load_dotenv(override=False)
 
 
+def _extract_query_terms(query: str) -> list:
+    """Extract simple meaningful terms from the query for matching."""
+    tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
+    # ignore very short tokens and common fillers
+    stop = {
+        "the","a","an","and","or","of","to","in","for","on","is","are",
+        "what","who","when","where","why","how","does","did","with","about"
+    }
+    return [t for t in tokens if len(t) >= 3 and t not in stop]
+
+
 def search_web(query: str) -> str:
-    """Perform a Serper.dev Google search and join snippets into a single string."""
+    """Perform a Serper.dev Google search and join snippets into a single string.
+
+    If there are no snippets or none contain meaningful query terms, return a
+    user-friendly 'No results found' message.
+    """
     if not os.getenv("SERPER_API_KEY"):
         raise RuntimeError(
             "SERPER_API_KEY is not set. Add it to your environment or .env file."
@@ -28,9 +44,21 @@ def search_web(query: str) -> str:
     search = GoogleSerperAPIWrapper()
     results = search.results(query)
 
-    snippets = [r.get("snippet", "") for r in results.get("organic", [])]
-    full_text = "\n\n".join(s.strip() for s in snippets if s.strip())
-    return full_text or "No snippets found. Try a different query."
+    organic = results.get("organic", []) or []
+    snippets = [r.get("snippet", "") for r in organic]
+
+    # Early no-result condition
+    if not any(s.strip() for s in snippets):
+        return f"No results found for: {query}"
+
+    # Heuristic: require at least one meaningful query term to appear
+    terms = _extract_query_terms(query)
+    combined = "\n\n".join(s.strip() for s in snippets if s.strip())
+    text_lc = combined.lower()
+    if terms and not any(t in text_lc for t in terms):
+        return f"No results found for: {query}"
+
+    return combined
 
 
 def summarize_with_anthropic(text: str, query: str) -> str:
@@ -114,7 +142,7 @@ if do_search and query.strip():
         st.subheader("Search Snippets")
         st.write(results_text)
 
-        if do_summary:
+        if do_summary and not results_text.lower().startswith("no results found"):
             with st.spinner("Summarizing..."):
                 summary = summarize_with_anthropic(results_text, query.strip())
             st.subheader("Summary")
