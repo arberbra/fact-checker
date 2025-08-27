@@ -2,7 +2,7 @@ import os
 import textwrap
 import re
 from io import BytesIO
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -87,11 +87,12 @@ def retrieve_top_k(retriever, chunks: List[str], query: str, k: int = 5) -> List
     return [(chunks[i], float(sims[i])) for i in idxs if sims[i] > 0]
 
 
-def search_web(query: str) -> str:
-    """Perform a Serper.dev Google search and join snippets into a single string.
+def search_web(query: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Perform a Serper.dev Google search and join snippets.
 
-    If there are no snippets or none contain meaningful query terms, return a
-    user-friendly 'No results found' message.
+    Returns a tuple of (combined_snippets_text, sources_list).
+    Each source has keys: title, link, snippet.
+    If there are no meaningful matches, combined text is a 'No results' message and sources can be empty.
     """
     if not os.getenv("SERPER_API_KEY"):
         raise RuntimeError(
@@ -103,19 +104,26 @@ def search_web(query: str) -> str:
 
     organic = results.get("organic", []) or []
     snippets = [r.get("snippet", "") for r in organic]
+    sources: List[Dict[str, Any]] = []
+    for r in organic:
+        sources.append({
+            "title": r.get("title", r.get("link", "")) or "(untitled)",
+            "link": r.get("link", ""),
+            "snippet": r.get("snippet", ""),
+        })
 
     # Early no-result condition
     if not any(s.strip() for s in snippets):
-        return f"No results found for: {query}"
+        return (f"No results found for: {query}", [])
 
     # Heuristic: require at least one meaningful query term to appear
     terms = _extract_query_terms(query)
     combined = "\n\n".join(s.strip() for s in snippets if s.strip())
     text_lc = combined.lower()
     if terms and not any(t in text_lc for t in terms):
-        return f"No results found for: {query}"
+        return (f"No results found for: {query}", sources)
 
-    return combined
+    return (combined, sources)
 
 
 def summarize_with_anthropic(text: str, query: str, rag_context: str = "") -> str:
@@ -230,15 +238,27 @@ with col2:
 if do_search and query.strip():
     try:
         with st.spinner("Searching the web..."):
-            web_text = search_web(query.strip())
+            web_text, web_sources = search_web(query.strip())
         st.subheader("Search Snippets")
         st.write(web_text)
+
+        if web_sources:
+            st.subheader("Sources")
+            for src in web_sources[:10]:
+                title = src.get("title") or src.get("link") or "(untitled)"
+                link = src.get("link") or ""
+                snippet = src.get("snippet", "")
+                if link:
+                    st.markdown(f"- [{title}]({link})")
+                else:
+                    st.markdown(f"- {title}")
+                if snippet:
+                    st.caption(snippet)
 
         rag_context = ""
         if use_rag and retriever is not None:
             with st.spinner("Retrieving from uploaded documents..."):
                 top = retrieve_top_k(retriever, retriever_chunks, query.strip(), k=5)
-                # annotate with simple source names when possible
                 rag_lines = []
                 for chunk, score in top:
                     rag_lines.append(f"[score={score:.2f}] {chunk}")

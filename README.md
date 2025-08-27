@@ -36,6 +36,10 @@ Open the URL printed in the terminal (usually http://localhost:8501).
 - Toggle "Use RAG" to enable retrieval from your uploaded docs.
 - The app chunks documents and builds a lightweight TF‑IDF index for similarity search.
 - Retrieved chunks are shown and also injected into the Anthropic summary when enabled.
+A
+### 4) Links and Sources
+- The "Sources" section lists top web results as clickable links, including a short snippet.
+- Uploaded documents are not linked directly; retrieved text is labeled and shown inline.
 
 ### Notes
 - The sidebar lets you paste keys at runtime; the app does not persist secrets.
