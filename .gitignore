@@ -1,1 +1,4 @@
 .env
+streamlit/secrets.toml
+fine_tuning/wandb/
+fine_tuning/data/

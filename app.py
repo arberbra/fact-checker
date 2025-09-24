@@ -1,6 +1,8 @@
 import os
 import textwrap
 import re
+import signal
+import time
 from io import BytesIO
 from typing import List, Tuple, Dict, Any
 
@@ -61,6 +63,133 @@ def _read_pdf(file_bytes: bytes) -> str:
             continue
     return "\n\n".join(s for s in out if s)
 
+
+
+# Bill Nye Model Integration
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from peft import PeftModel
+    import torch
+    HAS_BILL_NYE_MODEL = True
+except Exception:
+    HAS_BILL_NYE_MODEL = False
+
+def summarize_with_bill_nye(text: str, query: str, rag_context: str = "", model_name: str = None) -> str:
+    """Summarize retrieved text with Bill Nye personality model."""
+    if not HAS_BILL_NYE_MODEL:
+        return "Bill Nye model integration not available. Please install transformers and torch."
+    
+    if not model_name:
+        model_name = os.getenv("BILL_NYE_MODEL_NAME", "arberbr/bill-nye-science-guy")
+    
+    try:
+        # Check if model is already loaded in session state
+        model_key = f"bill_nye_model_{model_name.replace('/', '_')}"
+        tokenizer_key = f"bill_nye_tokenizer_{model_name.replace('/', '_')}"
+        
+        if model_key not in st.session_state or tokenizer_key not in st.session_state:
+            # Load model and tokenizer only if not already loaded
+            with st.spinner("Loading Bill Nye model (this may take a moment on first use)..."):
+                try:
+                    # The Bill Nye model is a LoRA adapter, so we need to load the base model first
+                    base_model_name = "microsoft/DialoGPT-medium"
+                    adapter_name = model_name  # This should be "arberbr/bill-nye-science-guy"
+                    
+                    # Load tokenizer from base model
+                    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+                    
+                    # Add padding token if it doesn't exist
+                    if tokenizer.pad_token is None:
+                        tokenizer.pad_token = tokenizer.eos_token
+                        tokenizer.pad_token_id = tokenizer.eos_token_id
+                    
+                    # Check if CUDA is available for optimal loading
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    
+                    if device == "cuda":
+                        # GPU loading with optimizations
+                        base_model = AutoModelForCausalLM.from_pretrained(
+                            base_model_name,
+                            torch_dtype=torch.float16,
+                            device_map="auto",
+                            low_cpu_mem_usage=True
+                        )
+                    else:
+                        # CPU loading with optimizations
+                        base_model = AutoModelForCausalLM.from_pretrained(
+                            base_model_name,
+                            torch_dtype=torch.float32,  # Use float32 for CPU
+                            low_cpu_mem_usage=True,
+                            use_cache=True  # Enable KV cache for faster inference
+                        )
+                        # Move to CPU explicitly
+                        base_model = base_model.to("cpu")
+                    
+                    # Load the LoRA adapter on top of the base model
+                    model = PeftModel.from_pretrained(base_model, adapter_name)
+                    
+                    # Cache in session state
+                    st.session_state[tokenizer_key] = tokenizer
+                    st.session_state[model_key] = model
+                    st.session_state[f"{model_key}_device"] = device
+                    
+                except Exception as e:
+                    st.error(f"Failed to load Bill Nye model: {str(e)}")
+                    return f"Model loading failed: {str(e)}"
+        else:
+            # Use cached model and tokenizer
+            tokenizer = st.session_state[tokenizer_key]
+            model = st.session_state[model_key]
+        
+        # Prepare context
+        context = text[:8000]  # Limit context size
+        rag = rag_context[:4000] if rag_context else ""
+        
+        # Create Bill Nye-style prompt
+        prompt = f"""Human: You are Bill Nye, the Science Guy. Answer the following question in your characteristic enthusiastic and educational style. Use scientific evidence and explain things in an engaging way that makes science accessible to everyone.
+
+Query: {query}
+
+Web search results: {context}
+
+Additional context: {rag or '[none]'}
+
+Please provide a fact-checked answer in your signature enthusiastic style!
+Bill Nye:"""
+        
+        # Tokenize and generate
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+        
+        # Get device info
+        device = st.session_state.get(f"{model_key}_device", "cpu")
+        
+        # Move inputs to the same device as model
+        if device == "cuda" and torch.cuda.is_available():
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=300,
+                temperature=0.7,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=True,  # Enable KV cache for faster generation
+                early_stopping=True  # Stop when EOS token is generated
+            )
+        
+        # Decode response
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract just Bill Nye's response (remove the prompt part)
+        if "Bill Nye:" in response:
+            response = response.split("Bill Nye:")[-1].strip()
+        
+        return response
+        
+    except Exception as e:
+        return f"Error generating Bill Nye response: {str(e)}"
 
 def build_retriever(docs: List[Tuple[str, str]]):
     """Build a TF-IDF retriever from a list of (source_name, text) docs."""
@@ -179,19 +308,65 @@ with st.sidebar:
         key="serper_key",
     )
     st.text_input(
+        "BILL_NYE_MODEL_NAME",
+        value=os.getenv("BILL_NYE_MODEL_NAME", "arberbr/bill-nye-science-guy"),
+        help="Hugging Face model name for Bill Nye personality",
+        key="bill_nye_model",
+    )
+    
+    # Model management buttons
+    col_clear, col_preload = st.columns(2)
+    
+    with col_clear:
+        if st.button("Clear Cache", help="Clear cached model to force reload"):
+            # Clear all Bill Nye model related session state
+            keys_to_remove = [key for key in st.session_state.keys() if key.startswith("bill_nye_")]
+            for key in keys_to_remove:
+                del st.session_state[key]
+            st.success("Model cache cleared!")
+    
+    with col_preload:
+        if st.button("Preload Model", help="Load model now to avoid delay later"):
+            if HAS_BILL_NYE_MODEL:
+                model_name = st.session_state.get("bill_nye_model", "arberbr/bill-nye-science-guy")
+                with st.spinner("Preloading Bill Nye model..."):
+                    result = summarize_with_bill_nye("test", "test")
+                    if not result.startswith("Model loading failed:"):
+                        st.success("Model preloaded successfully!")
+                    else:
+                        st.error("Failed to preload model")
+            else:
+                st.error("Transformers not available")
+    st.text_input(
         "ANTHROPIC_API_KEY",
         value=os.getenv("ANTHROPIC_API_KEY", ""),
         type="password",
         help="Optional Anthropic API key",
         key="anthropic_key",
     )
+    # Model status indicator
+    st.markdown("**Model Status:**")
+    model_name = st.session_state.get("bill_nye_model", "arberbr/bill-nye-science-guy")
+    model_key = f"bill_nye_model_{model_name.replace('/', '_')}"
+    
+    if model_key in st.session_state:
+        device = st.session_state.get(f"{model_key}_device", "unknown")
+        st.success(f"✅ Bill Nye model loaded ({device})")
+    else:
+        st.info("⏳ Bill Nye model not loaded")
+    
     st.markdown(
-        "- Requires Serper.dev key in `SERPER_API_KEY`.\n- Optional Anthropic key in `ANTHROPIC_API_KEY` for summaries."
+        """**Setup Notes:**
+- Requires Serper.dev key in `SERPER_API_KEY`.
+- Optional Anthropic key in `ANTHROPIC_API_KEY` for summaries.
+- Bill Nye model: LoRA adapter on DialoGPT-medium (no API key required).
+- Model components are cached in memory after first load for faster responses."""
     )
 
 # Keep env vars in sync with sidebar updates (no secrets are persisted by the app)
 os.environ["SERPER_API_KEY"] = st.session_state.get("serper_key", "")
 os.environ["ANTHROPIC_API_KEY"] = st.session_state.get("anthropic_key", "")
+os.environ["BILL_NYE_MODEL_NAME"] = st.session_state.get("bill_nye_model", "")
 
 # RAG document upload
 st.subheader("Knowledge Base (optional)")
@@ -271,11 +446,33 @@ if do_search and query.strip():
         elif use_rag and retriever is None:
             st.info("Upload documents first to enable RAG.")
 
-        if HAS_ANTHROPIC and os.getenv("ANTHROPIC_API_KEY") and not web_text.lower().startswith("no results found"):
+        if HAS_BILL_NYE_MODEL and not web_text.lower().startswith("no results found"):
+            with st.spinner("Getting Bill Nye's scientific perspective..."):
+                summary = summarize_with_bill_nye(web_text, query.strip(), rag_context)
+            
+            # Check if Bill Nye model failed and fallback to Anthropic if available
+            if summary.startswith("Model loading failed:") or summary.startswith("Error generating"):
+                st.warning("Bill Nye model unavailable. Falling back to Anthropic if available.")
+                if HAS_ANTHROPIC and os.getenv("ANTHROPIC_API_KEY"):
+                    with st.spinner("Summarizing with Anthropic..."):
+                        summary = summarize_with_anthropic(web_text, query.strip(), rag_context)
+                    st.subheader("Answer")
+                else:
+                    st.subheader("Search Results Summary")
+                    # Provide a basic summary without AI
+                    summary = f"**Query:** {query.strip()}\n\n**Key Information Found:**\n{web_text[:1000]}..."
+            else:
+                st.subheader("Bill Nye's Answer")
+            
+            st.write(summary)
+        elif HAS_ANTHROPIC and os.getenv("ANTHROPIC_API_KEY") and not web_text.lower().startswith("no results found"):
             with st.spinner("Summarizing with Anthropic..."):
                 summary = summarize_with_anthropic(web_text, query.strip(), rag_context)
             st.subheader("Answer")
             st.write(summary)
+        else:
+            # No AI available, just show search results
+            st.info("AI summarization unavailable. Showing search results above.")
     except Exception as e:
         st.error(str(e))
 elif do_search:
